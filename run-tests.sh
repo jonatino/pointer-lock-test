@@ -205,6 +205,11 @@ if [ "${ONLY:-}" = "focus-cycle" ]; then
     exit 0
 fi
 
+if [[ "${ONLY:-}" == startup-* ]]; then
+    run_case "$ONLY" "$ONLY"
+    exit $?
+fi
+
 if [ "${ONLY:-}" = "poison-session" ]; then
     poisoned=0
     for attempt in $(seq 1 "${POISON_ATTEMPTS:-12}"); do

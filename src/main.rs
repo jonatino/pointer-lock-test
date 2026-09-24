@@ -27,6 +27,9 @@
 //!   focus-cycle
 //!              release the game's grab/cursor hide on focus-out, then
 //!              reacquire both after focusing the game again (Cyberpunk shape)
+//!   startup-*
+//!              small first-launch ordering probes used to reproduce the
+//!              deterministic Cyberpunk failure from a fresh Xwayland session
 
 use std::{process::exit, thread::sleep, time::Duration};
 
@@ -222,6 +225,23 @@ fn warp_loop(ctx: &Ctx, rounds: usize) {
     }
 }
 
+fn warp_to(ctx: &Ctx, win: Window, x: i16, y: i16) {
+    ctx.conn
+        .warp_pointer(x11rb::NONE, win, 0, 0, 0, 0, x, y)
+        .unwrap();
+    ctx.conn.flush().unwrap();
+    settle(ctx, 150);
+}
+
+fn unmap_remap(ctx: &Ctx, win: Window, ms: u64) {
+    ctx.conn.unmap_window(win).unwrap();
+    ctx.conn.flush().unwrap();
+    settle(ctx, ms);
+    ctx.conn.map_window(win).unwrap();
+    ctx.conn.flush().unwrap();
+    settle(ctx, ms);
+}
+
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_default();
     let ctx = connect();
@@ -360,12 +380,169 @@ fn main() {
             hide_and_grab(&ctx, game);
             warp_loop(&ctx, 6);
         }
+        "startup-grab-before-fs" => {
+            let game = create_window(&ctx, false, 640, 480, 0x0020_a020, "startup-game");
+            settle(&ctx, 300);
+            activate_window(&ctx, game);
+            wait_input_focus(&ctx, game);
+            hide_and_grab(&ctx, game);
+            warp_loop(&ctx, 3);
+            set_fullscreen(&ctx, game, true);
+            settle(&ctx, 500);
+            warp_loop(&ctx, 8);
+        }
+        "startup-grab-before-focus" => {
+            let other = create_window(&ctx, false, 640, 480, 0x0060_60ff, "startup-other");
+            settle(&ctx, 400);
+            activate_window(&ctx, other);
+            wait_input_focus(&ctx, other);
+            let game = create_window(&ctx, false, 640, 480, 0x0020_a020, "startup-game");
+            settle(&ctx, 200);
+            hide_and_grab(&ctx, game);
+            warp_loop(&ctx, 3);
+            set_fullscreen(&ctx, game, true);
+            settle(&ctx, 300);
+            activate_window(&ctx, game);
+            wait_input_focus(&ctx, game);
+            warp_loop(&ctx, 8);
+        }
+        "startup-fs-before-focus" => {
+            let other = create_window(&ctx, false, 640, 480, 0x0060_60ff, "startup-other");
+            settle(&ctx, 400);
+            activate_window(&ctx, other);
+            wait_input_focus(&ctx, other);
+            let game = create_window(&ctx, false, 640, 480, 0x0020_a020, "startup-game");
+            settle(&ctx, 200);
+            set_fullscreen(&ctx, game, true);
+            if !wait_fullscreen_size(&ctx, game) {
+                eprintln!("game never became fullscreen");
+                exit(2);
+            }
+            hide_and_grab(&ctx, game);
+            warp_loop(&ctx, 4);
+            activate_window(&ctx, game);
+            wait_input_focus(&ctx, game);
+            warp_loop(&ctx, 8);
+        }
+        "startup-remap-before-grab" => {
+            let game = create_window(&ctx, false, 640, 480, 0x0020_a020, "startup-game");
+            settle(&ctx, 300);
+            set_fullscreen(&ctx, game, true);
+            wait_fullscreen_size(&ctx, game);
+            unmap_remap(&ctx, game, 250);
+            set_fullscreen(&ctx, game, true);
+            settle(&ctx, 350);
+            activate_window(&ctx, game);
+            wait_input_focus(&ctx, game);
+            hide_and_grab(&ctx, game);
+            warp_loop(&ctx, 8);
+        }
+        "startup-remap-after-grab" => {
+            let game = create_window(&ctx, false, 640, 480, 0x0020_a020, "startup-game");
+            settle(&ctx, 300);
+            set_fullscreen(&ctx, game, true);
+            wait_fullscreen_size(&ctx, game);
+            activate_window(&ctx, game);
+            wait_input_focus(&ctx, game);
+            hide_and_grab(&ctx, game);
+            warp_loop(&ctx, 3);
+            unmap_remap(&ctx, game, 250);
+            set_fullscreen(&ctx, game, true);
+            settle(&ctx, 350);
+            activate_window(&ctx, game);
+            wait_input_focus(&ctx, game);
+            warp_loop(&ctx, 8);
+        }
+        "startup-focus-churn" => {
+            let other = create_window(&ctx, false, 640, 480, 0x0060_60ff, "startup-other");
+            settle(&ctx, 300);
+            let game = create_window(&ctx, false, 640, 480, 0x0020_a020, "startup-game");
+            settle(&ctx, 300);
+            set_fullscreen(&ctx, game, true);
+            wait_fullscreen_size(&ctx, game);
+            activate_window(&ctx, game);
+            wait_input_focus(&ctx, game);
+            activate_window(&ctx, other);
+            wait_input_focus(&ctx, other);
+            activate_window(&ctx, game);
+            wait_input_focus(&ctx, game);
+            hide_and_grab(&ctx, game);
+            warp_loop(&ctx, 8);
+        }
+        "startup-focus-churn-grabbed" => {
+            let other = create_window(&ctx, false, 640, 480, 0x0060_60ff, "startup-other");
+            settle(&ctx, 300);
+            let game = create_window(&ctx, false, 640, 480, 0x0020_a020, "startup-game");
+            settle(&ctx, 300);
+            set_fullscreen(&ctx, game, true);
+            wait_fullscreen_size(&ctx, game);
+            activate_window(&ctx, game);
+            wait_input_focus(&ctx, game);
+            hide_and_grab(&ctx, game);
+            warp_loop(&ctx, 3);
+            activate_window(&ctx, other);
+            wait_input_focus(&ctx, other);
+            activate_window(&ctx, game);
+            wait_input_focus(&ctx, game);
+            warp_loop(&ctx, 8);
+        }
+        "startup-launcher-to-game" => {
+            let launcher = create_window(&ctx, false, 900, 600, 0x0060_60ff, "startup-launcher");
+            settle(&ctx, 400);
+            activate_window(&ctx, launcher);
+            wait_input_focus(&ctx, launcher);
+            let game = create_window(&ctx, false, 640, 480, 0x0020_a020, "startup-game");
+            settle(&ctx, 150);
+            activate_window(&ctx, game);
+            wait_input_focus(&ctx, game);
+            hide_and_grab(&ctx, game);
+            warp_loop(&ctx, 2);
+            set_fullscreen(&ctx, game, true);
+            settle(&ctx, 500);
+            warp_loop(&ctx, 8);
+        }
+        "startup-stale-pointer-focus" => {
+            // Force the Wayland pointer onto a different X11 surface first.
+            // The game then arms relative mode while windowed/off-pointer.
+            // Making it fullscreen changes which surface is geometrically
+            // under the stationary pointer; a compositor must refresh pointer
+            // focus so Xwayland can engage warp emulation on the first warp.
+            let other = create_window(&ctx, false, 640, 480, 0x0060_60ff, "startup-other");
+            settle(&ctx, 250);
+            set_fullscreen(&ctx, other, true);
+            wait_fullscreen_size(&ctx, other);
+            activate_window(&ctx, other);
+            wait_input_focus(&ctx, other);
+            warp_to(
+                &ctx,
+                ctx.root,
+                ctx.screen_w.saturating_sub(40) as i16,
+                ctx.screen_h.saturating_sub(40) as i16,
+            );
+
+            let game = create_window(&ctx, false, 320, 240, 0x0020_a020, "startup-game");
+            settle(&ctx, 250);
+            activate_window(&ctx, other);
+            wait_input_focus(&ctx, other);
+
+            // Arm the same X11 grab/cursor-hide state used by mouse-look, but
+            // do not warp yet: the Wayland pointer still belongs to `other`.
+            hide_and_grab(&ctx, game);
+            settle(&ctx, 150);
+
+            set_fullscreen(&ctx, game, true);
+            wait_fullscreen_size(&ctx, game);
+            activate_window(&ctx, game);
+            wait_input_focus(&ctx, game);
+            settle(&ctx, 250);
+            warp_loop(&ctx, 10);
+        }
         // exit 0 iff $DISPLAY accepts connections (used by run-tests.sh to
         // find the nested Xwayland among stale sockets)
         "probe" => exit(0),
         _ => {
             eprintln!(
-                "usage: pointer-lock-test <dummy|baseline|or-grab|fs-toggle|focus-away-grabbed|focus-cycle|probe>"
+                "usage: pointer-lock-test <dummy|baseline|or-grab|fs-toggle|focus-away-grabbed|focus-cycle|startup-*|probe>"
             );
             exit(2);
         }
