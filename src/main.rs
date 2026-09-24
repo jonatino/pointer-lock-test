@@ -27,15 +27,23 @@
 //!   focus-cycle
 //!              release the game's grab/cursor hide on focus-out, then
 //!              reacquire both after focusing the game again (Cyberpunk shape)
+//!   hover-fresh-lock
+//!              while keyboard focus is outside Xwayland, request the first
+//!              game-style pointer lock only after hovering an X11 target
 //!   startup-*
 //!              small first-launch ordering probes used to reproduce the
 //!              deterministic Cyberpunk failure from a fresh Xwayland session
 
-use std::{process::exit, thread::sleep, time::Duration};
+use std::{
+    process::exit,
+    thread::sleep,
+    time::{Duration, Instant},
+};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xfixes::ConnectionExt as XFixesExt;
 use x11rb::protocol::xproto::*;
+use x11rb::protocol::Event;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME};
 
@@ -225,6 +233,22 @@ fn warp_loop(ctx: &Ctx, rounds: usize) {
     }
 }
 
+fn warp_window_loop(ctx: &Ctx, win: Window, w: u16, h: u16, rounds: usize) {
+    let (cx, cy) = (w as i16 / 2, h as i16 / 2);
+    for i in 0..rounds {
+        let (tx, ty) = if i % 2 == 0 {
+            (cx, cy)
+        } else {
+            (cx - 17, cy - 11)
+        };
+        ctx.conn
+            .warp_pointer(x11rb::NONE, win, 0, 0, 0, 0, tx, ty)
+            .unwrap();
+        ctx.conn.flush().unwrap();
+        sleep(Duration::from_millis(150));
+    }
+}
+
 fn warp_to(ctx: &Ctx, win: Window, x: i16, y: i16) {
     ctx.conn
         .warp_pointer(x11rb::NONE, win, 0, 0, 0, 0, x, y)
@@ -379,6 +403,112 @@ fn main() {
             settle(&ctx, 100);
             hide_and_grab(&ctx, game);
             warp_loop(&ctx, 6);
+        }
+        "hover-fresh-lock" => {
+            let helper = create_window(&ctx, false, 480, 320, 0x0060_60ff, "hover-fresh-helper");
+            settle(&ctx, 400);
+            activate_window(&ctx, helper);
+            if !wait_input_focus(&ctx, helper) {
+                eprintln!("helper never received initial X input focus");
+                exit(2);
+            }
+
+            let target_w = 320u16.min(ctx.screen_w);
+            let target_h = 260u16.min(ctx.screen_h);
+            let pointer = ctx.conn.query_pointer(ctx.root).unwrap().reply().unwrap();
+            let pointer_x = pointer.root_x as i32;
+            let pointer_y = pointer.root_y as i32;
+            let target_x = (pointer_x - target_w as i32 / 2)
+                .clamp(0, (ctx.screen_w as i32 - target_w as i32).max(0));
+            let target_y = (pointer_y - target_h as i32 / 2)
+                .clamp(0, (ctx.screen_h as i32 - target_h as i32).max(0));
+            let target = create_window(
+                &ctx,
+                true,
+                target_w,
+                target_h,
+                0x00a0_2020,
+                "hover-fresh-target",
+            );
+            ctx.conn.unmap_window(target).unwrap();
+            ctx.conn
+                .change_window_attributes(
+                    target,
+                    &ChangeWindowAttributesAux::new().event_mask(
+                        EventMask::STRUCTURE_NOTIFY
+                            | EventMask::POINTER_MOTION
+                            | EventMask::ENTER_WINDOW,
+                    ),
+                )
+                .unwrap();
+            ctx.conn
+                .configure_window(
+                    target,
+                    &ConfigureWindowAux::new()
+                        .x(target_x)
+                        .y(target_y)
+                        .stack_mode(StackMode::ABOVE),
+                )
+                .unwrap();
+            ctx.conn.map_window(target).unwrap();
+            ctx.conn.flush().unwrap();
+
+            let pointer_deadline = Instant::now() + Duration::from_secs(3);
+            let mut target_has_pointer = false;
+            while Instant::now() < pointer_deadline && !target_has_pointer {
+                while let Some(event) = ctx.conn.poll_for_event().unwrap() {
+                    if let Event::EnterNotify(ev) = event {
+                        if ev.event == target {
+                            target_has_pointer = true;
+                            break;
+                        }
+                    }
+                }
+                if !target_has_pointer {
+                    sleep(Duration::from_millis(10));
+                }
+            }
+            if !target_has_pointer {
+                eprintln!("target never received pointer focus");
+                exit(2);
+            }
+
+            println!(
+                "HOVER_FRESH_READY helper=0x{helper:x} target=0x{target:x} pointer_x={pointer_x} pointer_y={pointer_y} x={target_x} y={target_y} w={target_w} h={target_h}"
+            );
+
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut focus_left_x11 = false;
+            let mut triggered = false;
+            while Instant::now() < deadline {
+                if !focus_left_x11 {
+                    focus_left_x11 = ctx
+                        .conn
+                        .get_input_focus()
+                        .unwrap()
+                        .reply()
+                        .is_ok_and(|reply| reply.focus != helper && reply.focus != target);
+                    if focus_left_x11 {
+                        println!("HOVER_FRESH_NATIVE_FOCUS");
+                    }
+                }
+
+                if focus_left_x11 && !triggered {
+                    hide_and_grab(&ctx, target);
+                    println!("HOVER_FRESH_TRIGGERED");
+                    warp_window_loop(&ctx, target, target_w, target_h, 6);
+                    println!("HOVER_FRESH_WARP_DONE");
+                    triggered = true;
+                }
+
+                while ctx.conn.poll_for_event().unwrap().is_some() {}
+                sleep(Duration::from_millis(10));
+            }
+
+            println!(
+                "HOVER_FRESH_DONE native_focus={} triggered={}",
+                focus_left_x11 as u8, triggered as u8
+            );
         }
         "startup-grab-before-fs" => {
             let game = create_window(&ctx, false, 640, 480, 0x0020_a020, "startup-game");
@@ -542,7 +672,7 @@ fn main() {
         "probe" => exit(0),
         _ => {
             eprintln!(
-                "usage: pointer-lock-test <dummy|baseline|or-grab|fs-toggle|focus-away-grabbed|focus-cycle|startup-*|probe>"
+                "usage: pointer-lock-test <dummy|baseline|or-grab|fs-toggle|focus-away-grabbed|focus-cycle|hover-fresh-lock|startup-*|probe>"
             );
             exit(2);
         }
