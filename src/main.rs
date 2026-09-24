@@ -21,6 +21,12 @@
 //!              mode" shape)
 //!   fs-toggle  grab and warp, then toggle fullscreen off/on, exercising the
 //!              focus-target transitions that can destroy an active lock
+//!   focus-away-grabbed
+//!              keep the game's X pointer grab active while another managed
+//!              window becomes active (KCD2 alt-tab shape)
+//!   focus-cycle
+//!              release the game's grab/cursor hide on focus-out, then
+//!              reacquire both after focusing the game again (Cyberpunk shape)
 
 use std::{process::exit, thread::sleep, time::Duration};
 
@@ -118,6 +124,36 @@ fn set_fullscreen(ctx: &Ctx, win: Window, on: bool) {
     ctx.conn.flush().unwrap();
 }
 
+fn activate_window(ctx: &Ctx, win: Window) {
+    let active = atom(ctx, "_NET_ACTIVE_WINDOW");
+    let ev = ClientMessageEvent::new(32, win, active, [1, CURRENT_TIME, 0, 0, 0]);
+    ctx.conn
+        .send_event(
+            false,
+            ctx.root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            ev,
+        )
+        .unwrap();
+    ctx.conn.flush().unwrap();
+}
+
+fn wait_input_focus(ctx: &Ctx, win: Window) -> bool {
+    for _ in 0..30 {
+        if ctx
+            .conn
+            .get_input_focus()
+            .unwrap()
+            .reply()
+            .is_ok_and(|reply| reply.focus == win)
+        {
+            return true;
+        }
+        sleep(Duration::from_millis(100));
+    }
+    false
+}
+
 fn wait_fullscreen_size(ctx: &Ctx, win: Window) -> bool {
     for _ in 0..30 {
         let geo = ctx.conn.get_geometry(win).unwrap().reply().unwrap();
@@ -133,7 +169,11 @@ fn wait_fullscreen_size(ctx: &Ctx, win: Window) -> bool {
 /// Both are preconditions for Xwayland's warp emulation (it bails out while
 /// an X cursor is visible).
 fn hide_and_grab(ctx: &Ctx, win: Window) {
-    ctx.conn.xfixes_query_version(4, 0).unwrap().reply().unwrap();
+    ctx.conn
+        .xfixes_query_version(4, 0)
+        .unwrap()
+        .reply()
+        .unwrap();
     ctx.conn.xfixes_hide_cursor(win).unwrap();
     let status = ctx
         .conn
@@ -158,12 +198,22 @@ fn hide_and_grab(ctx: &Ctx, win: Window) {
     ctx.conn.flush().unwrap();
 }
 
+fn show_and_ungrab(ctx: &Ctx, win: Window) {
+    ctx.conn.ungrab_pointer(CURRENT_TIME).unwrap();
+    ctx.conn.xfixes_show_cursor(win).unwrap();
+    ctx.conn.flush().unwrap();
+}
+
 /// Recenter the pointer a few times, the way a mouse-look game does every
 /// frame. This is what drives Xwayland to request the pointer lock.
 fn warp_loop(ctx: &Ctx, rounds: usize) {
     let (cx, cy) = (ctx.screen_w as i16 / 2, ctx.screen_h as i16 / 2);
     for i in 0..rounds {
-        let (tx, ty) = if i % 2 == 0 { (cx, cy) } else { (cx - 17, cy - 11) };
+        let (tx, ty) = if i % 2 == 0 {
+            (cx, cy)
+        } else {
+            (cx - 17, cy - 11)
+        };
         ctx.conn
             .warp_pointer(x11rb::NONE, ctx.root, 0, 0, 0, 0, tx, ty)
             .unwrap();
@@ -239,11 +289,84 @@ fn main() {
             sleep(Duration::from_millis(600));
             warp_loop(&ctx, 4);
         }
+        "focus-away-grabbed" => {
+            let other = create_window(&ctx, false, 640, 480, 0x0060_60ff, "other-app");
+            settle(&ctx, 500);
+
+            let game = create_window(&ctx, false, 640, 480, 0x0020_a020, "kcd2-game");
+            settle(&ctx, 500);
+            set_fullscreen(&ctx, game, true);
+            if !wait_fullscreen_size(&ctx, game) {
+                eprintln!("game never became fullscreen");
+                exit(2);
+            }
+            activate_window(&ctx, game);
+            settle(&ctx, 500);
+            if !wait_input_focus(&ctx, game) {
+                eprintln!("game never received X input focus");
+                exit(2);
+            }
+            hide_and_grab(&ctx, game);
+            warp_loop(&ctx, 4);
+
+            // Alt-tab shape: keyboard focus moves to another application while
+            // the game leaves its pointer grab active.
+            activate_window(&ctx, other);
+            settle(&ctx, 700);
+            if !wait_input_focus(&ctx, other) {
+                eprintln!("other window never received X input focus");
+                exit(2);
+            }
+            warp_loop(&ctx, 4);
+        }
+        "focus-cycle" => {
+            let other = create_window(&ctx, false, 640, 480, 0x0060_60ff, "other-app");
+            settle(&ctx, 500);
+
+            let game = create_window(&ctx, false, 640, 480, 0x0020_a020, "cyberpunk-game");
+            settle(&ctx, 500);
+            set_fullscreen(&ctx, game, true);
+            if !wait_fullscreen_size(&ctx, game) {
+                eprintln!("game never became fullscreen");
+                exit(2);
+            }
+            activate_window(&ctx, game);
+            settle(&ctx, 500);
+            if !wait_input_focus(&ctx, game) {
+                eprintln!("game never received initial X input focus");
+                exit(2);
+            }
+            hide_and_grab(&ctx, game);
+            warp_loop(&ctx, 4);
+
+            // Typical game focus-out path: another app becomes focused first,
+            // then the game reacts to FocusOut by exposing the cursor and
+            // dropping its X pointer grab.
+            activate_window(&ctx, other);
+            if !wait_input_focus(&ctx, other) {
+                eprintln!("other window never received X input focus");
+                exit(2);
+            }
+            show_and_ungrab(&ctx, game);
+            settle(&ctx, 250);
+
+            // Focus the game again and re-enter mouse-look.
+            activate_window(&ctx, game);
+            if !wait_input_focus(&ctx, game) {
+                eprintln!("game never regained X input focus");
+                exit(2);
+            }
+            settle(&ctx, 100);
+            hide_and_grab(&ctx, game);
+            warp_loop(&ctx, 6);
+        }
         // exit 0 iff $DISPLAY accepts connections (used by run-tests.sh to
         // find the nested Xwayland among stale sockets)
         "probe" => exit(0),
         _ => {
-            eprintln!("usage: pointer-lock-test <dummy|baseline|or-grab|fs-toggle|probe>");
+            eprintln!(
+                "usage: pointer-lock-test <dummy|baseline|or-grab|fs-toggle|focus-away-grabbed|focus-cycle|probe>"
+            );
             exit(2);
         }
     }
